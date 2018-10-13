@@ -1,0 +1,221 @@
+---
+title: "Topic Modeling with R"
+author: "Anna Anisienia"
+date: "23 Mai 2018"
+output: 
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# setwd("C:/Users/annaa/all_jupyter_notebooks")
+library(dplyr)
+library(topicmodels)
+library(tidytext)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(methods)
+library(widyr)
+#library(igraph)
+#library(ggraph)
+```
+
+## Data Preprocessing
+### Load the data
+
+```{r}
+data = read.csv(file = "ccn_reind.csv", sep = ";", encoding = "UTF-8", stringsAsFactors = FALSE)
+head(data)
+```
+
+```{r}
+glimpse(data)
+```
+
+At this point we could stem the documents (article column) so that ex. cryptocurrency and cryptocurrencies would be considered the same word. To speed the computation, we don't do this now, below there is a code to do this:
+```{r}
+# library("SnowballC")
+# library(tm)
+# data$article = stemDocument(data$article)
+```
+
+### Remove irrelevant features
+We can remove the URL and date columns (unnecessary for this analysis):
+```{r}
+data$url = NULL
+data$date = NULL
+glimpse(data)
+```
+### Tidy format
+Now, let's convert this dataframe into a tidy format and remove stopwords:
+```{r}
+by_title_word = data %>% unnest_tokens(word, article) %>% anti_join(stop_words)
+by_title_word
+```
+
+### The most common words across all articles
+
+```{r}
+by_title_word %>% count(word, sort = TRUE) 
+```
+
+
+### Word counts DataFrame
+let's add a column that is a count of unique words in each document, i.e. article.
+```{r}
+word_counts = by_title_word %>% count(title, word, sort = TRUE) 
+word_counts
+```
+
+To make computation faster and downweight the importance of obvious words such as **bitcoin or cryptocurrency**.
+Let's remove irrelevant words by using tf-idf (WHY? to avoid dominance of words Bitcoin, Cryprocurrency etc. which occur in almost any document and remove very uncommon words that occur only few times or only in very few documents). We do this by using `tidytext::bind_tf_idf`:
+```{r}
+desc_tf_idf = by_title_word %>% count(ind, title, word, sort = TRUE) %>% bind_tf_idf(ind, word, n) %>% arrange(-tf_idf)
+
+desc_tf_idf %>% select(-title)
+```
+
+We could remove numbers, but they might be important: ex. dramatic currency value changes reported in the news. Maybe they will be clustered into one topic? Let's keep them. What tf-idf should we consider a threshold for removing unimportant terms?
+```{r}
+c(min(desc_tf_idf$tf_idf), max(desc_tf_idf$tf_idf))
+```
+```{r}
+ggplot(data = desc_tf_idf, aes(x = tf_idf)) + geom_histogram() #+ scale_x_log10()
+```
+```{r}
+nrow(desc_tf_idf)
+```
+```{r}
+paste("We would remove", nrow(desc_tf_idf) - desc_tf_idf %>% filter(tf_idf > 0.10) %>% nrow(), "rows and keep only", desc_tf_idf %>% filter(tf_idf > 0.10) %>% nrow())
+```
+```{r}
+small_tf_idf = desc_tf_idf %>% filter(tf_idf > 0.10)
+small_tf_idf
+```
+
+## Latent Dirichlet Allocation with the topicmodels package
+Right now this data frame is in a tidy form: we treat each article as 1 document, so we have one-term-per-document-per-row format. However, the `topicmodels` package requires a `tm::DocumentTermMatrix`. We can **cast a one-token-per-row table into a DocumentTermMatrix** with `tidytext::cast_dtm`:
+
+```{r}
+dtm <- small_tf_idf %>% cast_dtm(title, word, n) # title = Document, word = term
+dtm
+```
+
+Now we are ready to use the topicmodels package to **create LDA model**. Since LDA is unsupervised learning, it is difficult to choose the correct number of topics. Coherence value can help to find a good value. If you want to find more about this: https://cran.r-project.org/web/packages/textmineR/vignettes/c_topic_modeling.html 
+
+In the following we fit two LDA models: one with 16 topics and one with 6.
+
+```{r}
+lda16 <- LDA(dtm, k = 16, control = list(seed = 1234))
+lda16
+```
+
+tidytext allows us to go back to a tidy format, using the `tidy()` and `augment()` functions from the `broom` package. We start with the tidy() function:
+
+```{r}
+tidy_lda16 = tidy(lda16)
+head(tidy_lda16)
+```
+```{r}
+str(tidy_lda16)
+```
+
+- this has turned the model into a `one-topic-per-term-per-row` format. For each combination the model returns **?? = probability of that term being generated from that topic**.
+- We can find the top 5 terms within each topic by using `dplyr::top_n`:
+```{r}
+tidy_lda16 %>% group_by(topic) %>% arrange(-beta) %>% top_n(5, beta) # 5 top terms per 16 topics = 80 rows
+```
+
+Since the probabilities are not very high, let's try to use just 6 topics in the second model:
+```{r}
+lda6 <- LDA(dtm, k = 6, control = list(seed = 1234))
+tidy_lda6 = tidy(lda6)
+tidy_lda6 %>% group_by(topic) %>% arrange(-beta) %>% top_n(14, beta) # 14 top terms per 6 topics = 84 rows to get similar nr of results
+```
+The probabilities now are even lower! So the model with 6 topics is probably worse. But it's interesting to see that there are similar words for topic 4 in both models. Let's investigate this:
+```{r}
+tidy_lda6 %>% group_by(topic) %>% filter(topic == 4) %>% arrange(-beta)
+tidy_lda16 %>% group_by(topic) %>% filter(topic == 4) %>% arrange(-beta)
+```
+
+We can see that terms **petro, oil, russian, venezuelan and maduro** were assigned to the same topic in both models. Petro is a cryptocurrency developed by the government of Venezuela, which is claimed to be backed by the country's oil and mineral reserves, and it is intended to supplement Venezuela's devalued currency bolívar.
+
+In the last try, let's look at the probabilities for each topic when we opt for 18 topics:
+```{r}
+lda18 <- LDA(dtm, k = 18, control = list(seed = 1234))
+tidy_lda18 = tidy(lda18)
+tidy_lda18 %>% group_by(topic) %>% arrange(-beta) %>% top_n(5, beta) # 14 top terms per 6 topics = 84 rows to get similar nr of results
+```
+Some probabilities went up. It seems like 18 topics produce a better model than lda6 and lda18. Let's look at the topic 4 again:
+```{r}
+tidy_lda18 %>% group_by(topic) %>% filter(topic == 4) %>% arrange(-beta)
+```
+
+the same pattern! you may ask: why Russian? The cryptocurrency petro was allegedly created in a half-hidden collaboration with the Government of Russia: http://time.com/5206835/exclusive-russia-petro-venezuela-cryptocurrency/ 
+
+Going back to topic modelling, we can find and visualize the top terms per topic: 
+```{r}
+top_terms <- tidy_lda18 %>% group_by(topic) %>% top_n(5, beta) %>%
+              ungroup() %>% arrange(topic, -beta) # ORDER the output from above BY topic ASC a. beta DESC
+
+top_terms
+```
+
+Visualization:
+
+```{r}
+top_terms %>% mutate(term = reorder(term, beta)) %>% 
+  ggplot(aes(term, beta, fill = topic)) +
+  geom_bar(stat = "identity", show.legend = FALSE) + # If you want heights of bars to represent values in the data 
+  coord_flip() +  # (you need to map a value to the y aesthetic) - without stat = "identity" plot returns an error
+  facet_wrap(~ topic, ncol = 6, scales = "free") + # free cause scales vary across rows and columns
+  theme(axis.text.x = element_text(size = 6, angle = 90)) + 
+  labs(title = "The highest tf-idf words per topic in CCN cryptocurrency news", x = "tf-idf word", y = "Beta probability of that word belonging to this topic")
+```
+
+### Per-document classification
+
+we can also find out which topics are associated with each document:
+```{r}
+gamma_lda18 = tidy(lda18, matrix="gamma")
+gamma_lda18 %>% arrange(-gamma)
+```
+The more words in each document are assigned to that topic, the more weight (gamma) will go on that document-topic classification. Let's look at the distribution of gamma values (we plot Y on a log scale to see more detailed, without it almost all values equal 0, some of them equal 1):
+```{r}
+ggplot(data=gamma_lda18, aes(x=gamma)) + geom_histogram() + scale_y_log10()
+```
+
+
+## Assignment to a topic by word: augment
+One important step in the topic modeling is **assigning each word in each document to a topic**. 
+- The more words in a document are assigned to a topic, the more weight (`gamma`) will go on that document-topic classification.
+- We may want to take the original document-word pairs and find which words in each document were assigned to which topic. This is the job of the `augment()` function.
+
+```{r}
+assignments <- augment(lda18, data = dtm)
+str(assignments)
+```
+```{r}
+assignments
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
